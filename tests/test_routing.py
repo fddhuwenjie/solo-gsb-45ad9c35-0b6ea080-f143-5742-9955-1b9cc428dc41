@@ -314,6 +314,90 @@ def test_step_timestamps_are_consistent():
     assert isinstance(r, RoutePlan)
 
 
+def test_no_waiting_graph_allows_repeating_segments_via_loop():
+    # 回归：全部节点禁等，车辆无法原地等待，唯一可行路线必须连续环行消磨时间。
+    # C1=S->X 4 分钟，C2=X->S 4 分钟，SB=S->B 1 分钟，BD=B->D 1 分钟；
+    # BD 在出发起的 [0,17) 禁行且无类别禁运。
+    # 直达：1 到 B 即进 BD，受阻；绕一圈：8 回 S、9 到 B 进 BD，仍受阻；
+    # 绕两圈：16 回 S、17 到 B，恰在窗口结束的第 17 分钟进入 BD，18 到达。
+    segments = [
+        seg("C1", "S", "X", 4),
+        seg("C2", "X", "S", 4),
+        seg("SB", "S", "B", 1),
+        seg("BD", "B", "D", 1, windows=[(0, 17)]),
+    ]
+    wn = nodes({"S": False, "X": False, "B": False, "D": False})
+    r = plan_route(segments, wn, "S", "D", set())
+    assert r.status == "success"
+    assert [s.segment_id for s in r.steps] == ["C1", "C2", "C1", "C2", "SB", "BD"]
+    assert (r.arrival, r.total_drive, r.total_wait) == (18, 18, 0)
+    assert [s.departure for s in r.steps] == [0, 4, 8, 12, 16, 17]
+    assert [s.arrival for s in r.steps] == [4, 8, 12, 16, 17, 18]
+    assert all(s.wait_before_minutes == 0 for s in r.steps)
+    assert r.waits == [] and r.blockages == []
+    # 逐段衔接：前段到达即后段出发（零等待）
+    assert all(a == b for a, b in zip(
+        [s.arrival for s in r.steps], [s.departure for s in r.steps[1:]]))
+    # 结果可复现
+    r2 = plan_route(segments, wn, "S", "D", set())
+    assert [s.segment_id for s in r2.steps] == [s.segment_id for s in r.steps]
+
+
+def test_looping_cannot_clear_embargo_and_search_terminates():
+    # 回归：恒闭禁运不能靠环行解除。图中含可无限重复的环（C1/C2），仍须在
+    # 有限时间内判定不可行：不返回部分行程，阻断原因稳定为 B->BD 的 embargo。
+    segments = [
+        seg("C1", "S", "X", 4),
+        seg("C2", "X", "S", 4),
+        seg("SB", "S", "B", 1),
+        seg("BD", "B", "D", 1, embargo={"3"}, windows=[(0, 17)]),
+    ]
+    r = plan_route(
+        segments, nodes({"S": False, "X": False, "B": False, "D": False}),
+        "S", "D", {"3"},
+    )
+    assert r.status == "infeasible"
+    assert r.steps == [] and r.waits == []
+    assert [(b.type, b.node_id, b.segment_id) for b in r.blockages] == [
+        ("embargo", "B", "BD")]
+    assert r.blockages[0].matched_classes == ("3",)
+
+
+def test_loop_burns_time_until_far_window_end():
+    # 环长 8 分钟，窗口 [0,100)：需要 8k+1 >= 100 => k=13，105 进 BD、106 到达，
+    # 全程零等待；验证有限终止界内多圈搜索与最早到达裁决。
+    segments = [
+        seg("C1", "S", "X", 4),
+        seg("C2", "X", "S", 4),
+        seg("SB", "S", "B", 1),
+        seg("BD", "B", "D", 1, windows=[(0, 100)]),
+    ]
+    r = plan_route(
+        segments, nodes({"S": False, "X": False, "B": False, "D": False}),
+        "S", "D", set(),
+    )
+    assert r.status == "success"
+    assert r.arrival == 106 and r.total_wait == 0
+    assert [s.segment_id for s in r.steps].count("C1") == 13
+    assert r.steps[-1].departure == 105
+
+
+def test_looping_path_beats_waiting_on_wait_tiebreak():
+    # 允许等待时环行仍可参与裁决：直达 G 在 S 等待 17（18 到、等 17），
+    # 两圈 C1/C2 后 t=16 再等 1，同样 18 到但仅等 1 => 总等待最少者胜。
+    segments = [
+        seg("C1", "S", "X", 4),
+        seg("C2", "X", "S", 4),
+        seg("G", "S", "D", 1, windows=[(0, 17)]),
+    ]
+    r = plan_route(
+        segments, nodes({"S": True, "X": False, "D": False}), "S", "D", set(),
+    )
+    assert r.status == "success"
+    assert (r.arrival, r.total_wait) == (18, 1)
+    assert [s.segment_id for s in r.steps] == ["C1", "C2", "C1", "C2", "G"]
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

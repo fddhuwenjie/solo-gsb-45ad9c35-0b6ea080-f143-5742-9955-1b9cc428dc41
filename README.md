@@ -16,7 +16,9 @@
 - **危险品运输路线编排**：为 success 方案提交本地有向道路图（路段 ID、行驶分钟、
   禁运类别、UTC 禁行窗口、节点是否允许等待）与起终点、出发时间；危险类别自动从
   方案**原始货物**提取。禁行窗口按 `[start,end)` 半开处理，通行区间与其相交即不可
-  进入；可在允许等待的节点停留到下一可行时刻。按 **最早到达 → 总等待最少 →
+  进入；可在允许等待的节点停留到下一可行时刻。**所有节点均禁止等待时，允许通过
+  连续环行（重复经过同一路段）推移到达时刻**，搜索在窗口最晚结束时刻后转为静态
+  最短路，保证有限时间结束。按 **最早到达 → 总等待最少 →
   路段 ID 序列字典序**确定唯一结果，返回逐段时刻与等待记录；无可行路线时返回
   **稳定排序的阻断原因**，不给出部分行程。结果持久化，支持按编号查询。
 
@@ -445,7 +447,90 @@ curl -X POST http://localhost:8000/plans/1/routes \
    因为等待会把出发推迟到同一窗口边界，可能抹平到达差）；
 3. 仍相同 → **路段 ID 序列字典序**（逐段比较 `segment_ids`）。
 
-### 9. 无可行路线（阻断原因，而非部分行程）
+### 9. 禁等节点图中必须环行（允许重复经过同一路段）
+
+当路径上**所有节点都禁止等待**时，车辆不能原地停留，只能通过连续环行把到达
+时刻推移到窗口结束之后——合法路线会重复经过同一路段，搜索允许这种环行并在
+有限时间内结束（窗口最晚结束时刻之后，问题退化为静态最短路）。
+
+例：`C1` 为 S→X（4 分钟）、`C2` 为 X→S（4 分钟）、`SB` 为 S→B（1 分钟）、
+`BD` 为 B→D（1 分钟）；`BD` 从出发起的 `[08:00,08:17)` 禁行且**无类别禁运**。
+直达（第 1 分钟进 BD）或只绕一圈（第 9 分钟进 BD）都受阻；车辆须连续两次走
+C1、C2（第 16 分钟回到 S），再走 SB、BD，**恰在第 17 分钟进入 BD**：
+
+```bash
+curl -X POST http://localhost:8000/plans/1/routes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"node_id": "S", "allow_waiting": false},
+      {"node_id": "X", "allow_waiting": false},
+      {"node_id": "B", "allow_waiting": false},
+      {"node_id": "D", "allow_waiting": false}
+    ],
+    "segments": [
+      {"segment_id": "C1", "from_node": "S", "to_node": "X",
+       "drive_minutes": 4, "embargo_classes": [], "windows": []},
+      {"segment_id": "C2", "from_node": "X", "to_node": "S",
+       "drive_minutes": 4, "embargo_classes": [], "windows": []},
+      {"segment_id": "SB", "from_node": "S", "to_node": "B",
+       "drive_minutes": 1, "embargo_classes": [], "windows": []},
+      {"segment_id": "BD", "from_node": "B", "to_node": "D",
+       "drive_minutes": 1, "embargo_classes": [],
+       "windows": [{"start": "2026-09-29T08:00:00Z", "end": "2026-09-29T08:17:00Z"}]}
+    ],
+    "origin": "S",
+    "destination": "D",
+    "departure_at": "2026-09-29T08:00:00Z"
+  }'
+```
+
+响应返回**完整逐段时刻**与**零等待记录**（环行是行驶而非等待，
+`total_wait_minutes=0`），结果同样持久化、可按编号查询：
+
+```json
+{
+  "route_id": 3,
+  "plan_id": 1,
+  "status": "success",
+  "origin": "S",
+  "destination": "D",
+  "departure_at": "2026-09-29T08:00:00Z",
+  "arrival_at": "2026-09-29T08:18:00Z",
+  "total_drive_minutes": 18,
+  "total_wait_minutes": 0,
+  "segment_ids": ["C1", "C2", "C1", "C2", "SB", "BD"],
+  "hazard_classes": ["3", "5.1"],
+  "steps": [
+    {"segment_id": "C1", "from_node": "S", "to_node": "X",
+     "departure_at": "2026-09-29T08:00:00Z", "arrival_at": "2026-09-29T08:04:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "C2", "from_node": "X", "to_node": "S",
+     "departure_at": "2026-09-29T08:04:00Z", "arrival_at": "2026-09-29T08:08:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "C1", "from_node": "S", "to_node": "X",
+     "departure_at": "2026-09-29T08:08:00Z", "arrival_at": "2026-09-29T08:12:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "C2", "from_node": "X", "to_node": "S",
+     "departure_at": "2026-09-29T08:12:00Z", "arrival_at": "2026-09-29T08:16:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "SB", "from_node": "S", "to_node": "B",
+     "departure_at": "2026-09-29T08:16:00Z", "arrival_at": "2026-09-29T08:17:00Z",
+     "drive_minutes": 1, "wait_before_minutes": 0},
+    {"segment_id": "BD", "from_node": "B", "to_node": "D",
+     "departure_at": "2026-09-29T08:17:00Z", "arrival_at": "2026-09-29T08:18:00Z",
+     "drive_minutes": 1, "wait_before_minutes": 0}
+  ],
+  "waits": [],
+  "blockages": []
+}
+```
+
+若上例中 `BD` 改为对本车载货类别恒闭（`embargo_classes` 相交），环行再多圈
+也无法解除，仍返回 `status=infeasible` 且阻断原因稳定为 `B`→`BD` 的
+`embargo`，绝不给出部分行程。
+
+### 10. 无可行路线（阻断原因，而非部分行程）
 
 `status=infeasible` 时 `steps`、`waits`、`segment_ids` 必为空，
 `arrival_at=null`，`blockages` 给出**稳定排序**的阻断原因
@@ -502,7 +587,7 @@ curl -X POST http://localhost:8000/plans/1/routes \
 `t < end 且 t+drive > start`；因此**恰在窗口结束时刻进入**（`t == end`）或
 **恰在窗口开始时刻到达**（`t+drive == start`）均允许。
 
-### 10. 按编号查询路线
+### 11. 按编号查询路线
 
 ```bash
 curl http://localhost:8000/routes/1
@@ -558,7 +643,7 @@ app/
   main.py          # FastAPI 入口与接口
   solver.py        # CP-SAT 两阶段求解 + 不可行冲突诊断
   executions.py    # 现场执行：执行单创建、扫描事件批次应用与状态查询
-  routing.py       # 时间相关多标号最短路：禁运、半开窗口、节点等待、阻断收集
+  routing.py       # 时间相关多标号最短路：禁运、半开窗口、节点等待、环行、阻断收集
   route_service.py # 路线编排服务：危险类别提取、UTC 换算、持久化与查询
   schemas.py       # 请求/响应模型与校验
   models.py        # ORM：方案、禁配规则、执行单、货物状态、事件记录、路线

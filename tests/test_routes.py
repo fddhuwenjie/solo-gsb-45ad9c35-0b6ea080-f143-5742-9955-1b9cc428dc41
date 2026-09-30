@@ -390,6 +390,73 @@ def test_route_endpoint_function_wraps_service():
         db.close()
 
 
+def _loop_graph_request():
+    """全节点禁等 + S<->X 环 + BD 在 [08:00,08:17) 禁行：必须连绕两圈。"""
+    return RouteRequest(**{
+        "nodes": [
+            {"node_id": "S", "allow_waiting": False},
+            {"node_id": "X", "allow_waiting": False},
+            {"node_id": "B", "allow_waiting": False},
+            {"node_id": "D", "allow_waiting": False},
+        ],
+        "segments": [
+            {"segment_id": "C1", "from_node": "S", "to_node": "X",
+             "drive_minutes": 4, "embargo_classes": [], "windows": []},
+            {"segment_id": "C2", "from_node": "X", "to_node": "S",
+             "drive_minutes": 4, "embargo_classes": [], "windows": []},
+            {"segment_id": "SB", "from_node": "S", "to_node": "B",
+             "drive_minutes": 1, "embargo_classes": [], "windows": []},
+            {"segment_id": "BD", "from_node": "B", "to_node": "D",
+             "drive_minutes": 1, "embargo_classes": [],
+             "windows": [{"start": "2026-09-29T08:00:00Z",
+                          "end": "2026-09-29T08:17:00Z"}]},
+        ],
+        "origin": "S",
+        "destination": "D",
+        "departure_at": "2026-09-29T08:00:00Z",
+    })
+
+
+def test_no_waiting_loop_route_persisted_with_full_steps_and_zero_wait():
+    # 回归：禁等节点图中需要重复经过同一批路段（C1、C2 各两次）消磨时间，
+    # 恰在第 17 分钟进入 BD。响应须含完整逐段时刻、零等待记录并持久化。
+    db = _db()
+    try:
+        plan_id = _make_plan(db)
+        resp = create_route(db, plan_id, _loop_graph_request())
+        assert resp.status == "success"
+        assert resp.segment_ids == ["C1", "C2", "C1", "C2", "SB", "BD"]
+        assert resp.arrival_at.isoformat() == "2026-09-29T08:18:00+00:00"
+        assert resp.total_drive_minutes == 18
+        assert resp.total_wait_minutes == 0
+        assert resp.waits == [] and resp.blockages == []
+        expected = [
+            ("C1", "08:00", "08:04", 0),
+            ("C2", "08:04", "08:08", 0),
+            ("C1", "08:08", "08:12", 0),
+            ("C2", "08:12", "08:16", 0),
+            ("SB", "08:16", "08:17", 0),
+            ("BD", "08:17", "08:18", 0),
+        ]
+        assert len(resp.steps) == 6
+        for st, (sid, dep, arr, wait) in zip(resp.steps, expected):
+            assert st.segment_id == sid
+            assert st.departure_at.isoformat() == f"2026-09-29T{dep}:00+00:00"
+            assert st.arrival_at.isoformat() == f"2026-09-29T{arr}:00+00:00"
+            assert st.wait_before_minutes == wait
+        # 持久化后逐段时刻与零等待记录仍可按编号查询
+        got = get_route(db, resp.route_id)
+        assert got.status == "success"
+        assert got.segment_ids == resp.segment_ids
+        assert got.arrival_at == resp.arrival_at
+        assert [(s.segment_id, s.departure_at, s.arrival_at) for s in got.steps] == \
+            [(s.segment_id, s.departure_at, s.arrival_at) for s in resp.steps]
+        assert got.total_wait_minutes == 0 and got.waits == []
+        assert list_plan_routes(plan_id, db)[-1].status == "success"
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
