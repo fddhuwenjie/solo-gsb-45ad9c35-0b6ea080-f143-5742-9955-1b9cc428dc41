@@ -18,7 +18,10 @@
   方案**原始货物**提取。禁行窗口按 `[start,end)` 半开处理，通行区间与其相交即不可
   进入；可在允许等待的节点停留到下一可行时刻。按 **最早到达 → 总等待最少 →
   路段 ID 序列字典序**确定唯一结果，返回逐段时刻与等待记录；无可行路线时返回
-  **稳定排序的阻断原因**，不给出部分行程。结果持久化，支持按编号查询。
+  **稳定排序的阻断原因**，不给出部分行程。**允许合法环行**：所有节点禁等、需要
+  重复经过同一路段以零等待消磨时间、恰在窗口结束后进入后续路段的路线同样可解，
+  搜索在有限时间（由最晚窗口结束时刻与图规模给出的上界）内结束。结果持久化，
+  支持按编号查询。
 
 ## 快速启动
 
@@ -502,6 +505,92 @@ curl -X POST http://localhost:8000/plans/1/routes \
 `t < end 且 t+drive > start`；因此**恰在窗口结束时刻进入**（`t == end`）或
 **恰在窗口开始时刻到达**（`t+drive == start`）均允许。
 
+### 9.1 禁等节点图中的合法环行（重复经过同一路段）
+
+当**所有节点都禁止等待**时，车辆无法原地停留，但可以**连续环行**以零等待消磨
+时间，恰在禁行窗口结束后进入后续路段——搜索允许重复经过同一节点/路段。
+
+例：`C1` 为 S→X（4 分钟）、`C2` 为 X→S（4 分钟）、`SB` 为 S→B（1 分钟）、
+`BD` 为 B→D（1 分钟）；BD 从出发起 `[08:00,08:17)` 禁行、无类别禁运。
+
+- 直接走 SB、BD：08:01 到 B，通行区间 `[08:01,08:02)` 与窗口相交，B 禁等；
+- 绕一圈 C1、C2（8 分钟）后再走 SB、BD：08:09 到 B，仍在窗口内；
+- **连续两圈** C1、C2 后于 08:16 走 SB，08:17 到 B，恰在窗口结束时刻进入 BD，
+  08:18 到达，全程零等待。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/routes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"node_id": "S", "allow_waiting": false},
+      {"node_id": "X", "allow_waiting": false},
+      {"node_id": "B", "allow_waiting": false},
+      {"node_id": "D", "allow_waiting": false}
+    ],
+    "segments": [
+      {"segment_id": "C1", "from_node": "S", "to_node": "X",
+       "drive_minutes": 4, "embargo_classes": [], "windows": []},
+      {"segment_id": "C2", "from_node": "X", "to_node": "S",
+       "drive_minutes": 4, "embargo_classes": [], "windows": []},
+      {"segment_id": "SB", "from_node": "S", "to_node": "B",
+       "drive_minutes": 1, "embargo_classes": [], "windows": []},
+      {"segment_id": "BD", "from_node": "B", "to_node": "D",
+       "drive_minutes": 1, "embargo_classes": [],
+       "windows": [{"start": "2026-09-29T08:00:00Z",
+                    "end":   "2026-09-29T08:17:00Z"}]}
+    ],
+    "origin": "S",
+    "destination": "D",
+    "departure_at": "2026-09-29T08:00:00Z"
+  }'
+```
+
+响应（完整逐段时刻、`waits` 为空并持久化）：
+
+```json
+{
+  "route_id": 3,
+  "plan_id": 1,
+  "status": "success",
+  "origin": "S",
+  "destination": "D",
+  "departure_at": "2026-09-29T08:00:00Z",
+  "arrival_at": "2026-09-29T08:18:00Z",
+  "total_drive_minutes": 18,
+  "total_wait_minutes": 0,
+  "segment_ids": ["C1", "C2", "C1", "C2", "SB", "BD"],
+  "hazard_classes": ["3", "5.1"],
+  "steps": [
+    {"segment_id": "C1", "from_node": "S", "to_node": "X",
+     "departure_at": "2026-09-29T08:00:00Z", "arrival_at": "2026-09-29T08:04:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "C2", "from_node": "X", "to_node": "S",
+     "departure_at": "2026-09-29T08:04:00Z", "arrival_at": "2026-09-29T08:08:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "C1", "from_node": "S", "to_node": "X",
+     "departure_at": "2026-09-29T08:08:00Z", "arrival_at": "2026-09-29T08:12:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "C2", "from_node": "X", "to_node": "S",
+     "departure_at": "2026-09-29T08:12:00Z", "arrival_at": "2026-09-29T08:16:00Z",
+     "drive_minutes": 4, "wait_before_minutes": 0},
+    {"segment_id": "SB", "from_node": "S", "to_node": "B",
+     "departure_at": "2026-09-29T08:16:00Z", "arrival_at": "2026-09-29T08:17:00Z",
+     "drive_minutes": 1, "wait_before_minutes": 0},
+    {"segment_id": "BD", "from_node": "B", "to_node": "D",
+     "departure_at": "2026-09-29T08:17:00Z", "arrival_at": "2026-09-29T08:18:00Z",
+     "drive_minutes": 1, "wait_before_minutes": 0}
+  ],
+  "waits": [],
+  "blockages": []
+}
+```
+
+环行不能解除**类别禁运**（恒闭），真正无解时依旧只返回稳定排序的阻断原因、
+不给部分行程。搜索的有限终止由时间上界保证：所有窗口结束之后图即退化为静态
+开放网络，任何可行路线都存在到达不晚于「最晚窗口结束 + 节点数 × 最长单段
+行驶」的等价走法，超出该上界的标号直接剪枝。
+
 ### 10. 按编号查询路线
 
 ```bash
@@ -558,7 +647,7 @@ app/
   main.py          # FastAPI 入口与接口
   solver.py        # CP-SAT 两阶段求解 + 不可行冲突诊断
   executions.py    # 现场执行：执行单创建、扫描事件批次应用与状态查询
-  routing.py       # 时间相关多标号最短路：禁运、半开窗口、节点等待、阻断收集
+  routing.py       # 时间相关多标号最短路：禁运、半开窗口、节点等待、合法环行、阻断收集
   route_service.py # 路线编排服务：危险类别提取、UTC 换算、持久化与查询
   schemas.py       # 请求/响应模型与校验
   models.py        # ORM：方案、禁配规则、执行单、货物状态、事件记录、路线

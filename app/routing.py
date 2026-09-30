@@ -19,9 +19,7 @@
 - 到达时刻是关于 t 的非递减函数（FIFO），t 更小者不会更晚到达；
 - 被窗口"抹平"到达时刻时，drive 更大者总等待更少；
 
-支配判定分两种节点（还要求支配者的已用边集合包含于被支配者，保证后续可选边
-不更少；相同 `(t, drive)` 但已用边集合不同的标号不可合并——它们对后续边的
-可用性不同，最优路线可能合法地重访节点走不同边）：
+支配判定分两种节点：
 
 - **允许等待**的节点：早到标号可等待到晚到标号的时刻，故 A 支配 B 当且仅当
   t_A < t_B 且 drive_A **严格大于** drive_B（drive 相等时等待差会被追平，
@@ -30,8 +28,17 @@
   而早到标号被窗口关闭且无法等待。
 
 两类节点共有的安全规则：t 相同则 drive 更大者支配（同一边可行性只取决于
-节点与到达时刻，后续每个时刻都更优且等待更少）；相同 `(t, drive)` 且
-已用边集合相同时，只保留路段序列字典序最小者。
+节点与到达时刻，后续每个时刻都更优且等待更少）；相同 `(t, drive)` 时只保留
+路段序列字典序最小者（此时两条路径互不为前缀——否则累计行驶不可能相等，
+故同接任意后缀字典序关系保持不变）。
+
+环行（重复经过同一节点/路段）必须允许：禁等节点上 FIFO"删环"论证不成立——
+提前回到某节点反而可能落入禁行窗口，合法最优路线可能需要连续环行若干圈
+（以零等待消磨时间）恰在窗口结束后进入后续路段。有限时间内必能结束：令
+H=max(0, 所有窗口最大结束时刻)、D=最长单段行驶、N=节点数，则任何可行路线
+都可化为"进入时刻 < H 的边至多 H 条 + 其后无窗口区域内至多 N-1 条边的简单
+路径"，其到达不晚于 H-1+N*D；到达时刻超过该上界的标号不可能参与最优解，
+直接剪枝，标号空间有限。
 """
 from __future__ import annotations
 
@@ -144,7 +151,6 @@ class _Label:
     path: tuple[str, ...]
     steps: tuple[Step, ...]
     waits: tuple[Wait, ...]
-    visited: frozenset[str] = frozenset()  # 本路径已用路段（不重复走同一边）
 
 
 def earliest_entry(
@@ -191,8 +197,17 @@ def plan_route(
         outs.sort(key=lambda s: s.segment_id)  # 放松顺序确定，保证记录可复现
     allow_wait = {n.node_id: n.allow_waiting for n in nodes}
 
-    root = _Label(node=origin, t=0, drive=0, total_wait=0, path=(), steps=(), waits=(),
-                  visited=frozenset())
+    # 有限时间上界（保证允许环行后搜索仍终止，见模块说明）：
+    # 任何可行路线都存在到达不晚于该上界的等价走法。
+    horizon_end = 0
+    for seg in segments:
+        for w in seg.windows:
+            if w.end > horizon_end:
+                horizon_end = w.end
+    max_drive = max((s.drive_minutes for s in segments), default=0)
+    arrival_bound = horizon_end + len(nodes) * max_drive
+
+    root = _Label(node=origin, t=0, drive=0, total_wait=0, path=(), steps=(), waits=())
     buckets: dict[str, list[_Label]] = {origin: [root]}
     heap: list[tuple[int, int, _Label]] = [(0, 0, root)]
     counter = 1
@@ -207,37 +222,33 @@ def plan_route(
 
     def insert(label: _Label) -> None:
         nonlocal counter
+        # 超过有限时间上界的标号不可能参与最优路线（见模块说明中的界）
+        if label.t > arrival_bound:
+            return
         # 到达终点不可能比已知最优到达“更早”（后续行驶分钟为正），故仅严格更晚才丢弃；
         # t 相同的标号必须保留——总等待可能更少、路段序列可能字典序更小
         if best_dest is not None and label.t > best_dest.t:
             return
         # 禁等节点上“更早到达”不能等待到晚到时刻，晚到标号可能恰好越过窗口，
         # 故 t 更小的标号不具支配力；仅相同 t 可比（边可行性只取决于节点与 t）。
-        # 跨标号支配还要求已用边集合包含（visited_A ⊆ visited_B）：A 能走的后续边
-        # 不比 B 少，否则即便时刻更优也可能因边已被占用而缺少 B 的可行延续。
         waiting_node = allow_wait.get(label.node, False)
         bucket = buckets.setdefault(label.node, [])
         survivors: list[_Label] = []
         for old in bucket:
-            if old.t == label.t and old.drive == label.drive \
-                    and old.visited == label.visited:
+            if old.t == label.t and old.drive == label.drive:
                 # 相同状态：只保留路段序列字典序最小者
                 if label.path < old.path:
                     continue  # old 被替换
                 return
             # 新标号被旧标号支配
-            if (old.t == label.t and old.drive > label.drive
-                    and old.visited <= label.visited):
+            if old.t == label.t and old.drive > label.drive:
                 return
-            if (waiting_node and old.t < label.t and old.drive > label.drive
-                    and old.visited <= label.visited):
+            if waiting_node and old.t < label.t and old.drive > label.drive:
                 return
             # 旧标号被新标号支配
-            if (old.t == label.t and label.drive > old.drive
-                    and label.visited <= old.visited):
+            if old.t == label.t and label.drive > old.drive:
                 continue
-            if (waiting_node and label.t < old.t and label.drive > old.drive
-                    and label.visited <= old.visited):
+            if waiting_node and label.t < old.t and label.drive > old.drive:
                 continue
             survivors.append(old)
         survivors.append(label)
@@ -263,10 +274,6 @@ def plan_route(
 
         for seg in adj.get(label.node, ()):
             key = (label.node, seg.segment_id)
-            if seg.segment_id in label.visited:
-                # 同一路径不重复走同一边：含重复边必带环，删环后首达不晚（FIFO）、
-                # 等待/行驶不增、序列字典序更小，故最优路线必为简单边路径
-                continue
             matched = seg.embargo_classes & carried_classes
             if matched:
                 # 禁运类别为恒闭阻断，与到达时刻无关
@@ -331,7 +338,6 @@ def plan_route(
                 path=label.path + (seg.segment_id,),
                 steps=label.steps + (step,),
                 waits=waits,
-                visited=label.visited | {seg.segment_id},
             ))
 
     if best_dest is not None:

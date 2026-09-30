@@ -314,6 +314,87 @@ def test_step_timestamps_are_consistent():
     assert isinstance(r, RoutePlan)
 
 
+def test_no_waiting_graph_requires_repeating_edges_in_double_loop():
+    # 回归：所有节点禁等，合法路线必须连续两圈重复经过 C1、C2，
+    # 以零等待消磨时间，恰在第 17 分钟进入 BD。
+    # 直达（SB+BD 在 t=1 被 [0,17) 拦下）或只绕一圈（t=9 被拦）均不可行；
+    # 旧实现禁止同一路径重复走同一边（误信禁等图上的 FIFO 删环论证），误判 infeasible。
+    segments = [
+        seg("C1", "S", "X", 4),
+        seg("C2", "X", "S", 4),
+        seg("SB", "S", "B", 1),
+        seg("BD", "B", "D", 1, windows=[(0, 17)]),
+    ]
+    r = plan_route(
+        segments,
+        nodes({"S": False, "X": False, "B": False, "D": False}),
+        "S", "D", set(),
+    )
+    assert r.status == "success"
+    assert [s.segment_id for s in r.steps] == ["C1", "C2", "C1", "C2", "SB", "BD"]
+    assert (r.arrival, r.total_drive, r.total_wait) == (18, 18, 0)
+    assert r.waits == [] and r.blockages == []
+    # 完整逐段时刻
+    assert [(s.departure, s.arrival, s.wait_before_minutes) for s in r.steps] == [
+        (0, 4, 0), (4, 8, 0), (8, 12, 0), (12, 16, 0), (16, 17, 0), (17, 18, 0),
+    ]
+    # BD 恰在窗口结束时刻（t == end）进入，半开语义允许
+    assert r.steps[-1].departure == 17
+
+
+def test_loop_search_terminates_with_long_window_and_many_rounds():
+    # 回归（有限时间结束）：环 6 分钟 + SB 1，B 时刻恒为 1 mod 6；
+    # BD 窗口 [0,100)、行驶 2，需连续 17 圈后在 t=103 进入，105 到达。
+    # 到达上界 H+N*D = 100+4*3 = 112，搜索必须在有限标号内结束并求得最优。
+    segments = [
+        seg("L1", "S", "X", 3),
+        seg("L2", "X", "S", 3),
+        seg("SB", "S", "B", 1),
+        seg("BD", "B", "D", 2, windows=[(0, 100)]),
+    ]
+    r = plan_route(
+        segments,
+        nodes({"S": False, "X": False, "B": False, "D": False}),
+        "S", "D", set(),
+    )
+    assert r.status == "success"
+    assert r.arrival == 105 and r.total_wait == 0
+    ids = [s.segment_id for s in r.steps]
+    assert ids == ["L1", "L2"] * 17 + ["SB", "BD"]
+    assert len(ids) == 36
+
+
+def test_loop_cannot_relieve_embargo_and_blockage_stable():
+    # 环行合法但真正无解时仍不得返回部分行程，阻断原因保持稳定：
+    # BD 对类别 3 恒闭，绕多少圈都无法解除禁运。
+    segments = [
+        seg("C1", "S", "X", 4),
+        seg("C2", "X", "S", 4),
+        seg("SB", "S", "B", 1),
+        seg("BD", "B", "D", 1, embargo={"3"}, windows=[(0, 17)]),
+    ]
+    r = plan_route(
+        segments,
+        nodes({"S": False, "X": False, "B": False, "D": False}),
+        "S", "D", {"3"},
+    )
+    assert r.status == "infeasible"
+    assert r.steps == [] and r.waits == [] and r.arrival is None
+    assert [(b.type, b.node_id, b.segment_id) for b in r.blockages] == [
+        ("embargo", "B", "BD")
+    ]
+
+
+def test_loop_in_disconnected_graph_still_reports_unreachable():
+    # 允许环行后，无窗口的纯环图也必须在有限时间内结束：终点不可达 => unreachable。
+    segments = [seg("L1", "S", "X", 3), seg("L2", "X", "S", 3)]
+    r = plan_route(
+        segments, nodes({"S": False, "X": False, "D": False}), "S", "D", set()
+    )
+    assert r.status == "infeasible"
+    assert r.blockages[0].type == "unreachable"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
